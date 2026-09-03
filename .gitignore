@@ -1,0 +1,39 @@
+# --- 秘密情報（最重要）---
+.env
+.env.*
+*.key
+config.local.*
+secrets.*
+
+# --- 録音・文字起こし・要約の実データ（会議内容そのもの。絶対に入れない）---
+*.wav
+*.mp3
+*.flac
+*.m4a
+recordings/
+transcripts/
+summaries/
+models/
+
+# --- Rust ---
+target/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# --- .NET ---
+bin/
+obj/
+*.user
+
+# --- OS / エディタ ---
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
