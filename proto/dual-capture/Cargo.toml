@@ -1,0 +1,12 @@
+[package]
+name = "dual-capture"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+cpal = "0.18.2"
+hound = "3.5"
+
+[profile.release]
+opt-level = 2
