@@ -39,6 +39,34 @@ run.cmd --repair <壊れた.wav>                 途中終了した WAV のヘ�
 **既定任せにしない**。ヘッドホンジャックのエンドポイントは抜き差しで一覧から消え、
 既定が耳に届かないデバイスへ移る（ADR-005）。指定を忘れると1時間ぶんの無音 WAV ができる。
 
+## 単一 exe として配る（ビルドが通らないとき / ADR-011 の先取り）
+
+`-C target-feature=+crt-static` を付けると **VC++ ランタイムへの依存が消え、1ファイルで動く**。
+
+```
+cargo build --release --target-dir target-static \
+  --config "build.rustflags=[\"-C\",\"target-feature=+crt-static\"]"
+```
+
+| ビルド | サイズ | 依存 DLL |
+|---|---|---|
+| 既定 | 520KB | `VCRUNTIME140.dll` / `api-ms-win-crt-*.dll` |
+| **crt-static** | **653KB** | **なし**（実測。`grep -ao "VCRUNTIME.*dll"` で確認できる） |
+
+出来た `target-static/release/dual-capture.exe` を置くだけで動く。Rust もリポジトリも要らない。
+
+```
+dual-capture.exe --mic=Logi --loopback=Logi
+```
+
+**業務ノートでビルドが通らないときの逃げ道**でもある。あちらは GNU ツールチェーン（MinGW）で、
+`raw-dylib` まわりで詰まる前例がある（NOTES.md「Windows側の環境構築でハマった点」）。
+依存を足したあとにビルドが通らなくなったら、**開発デスクトップで作った exe を運ぶ**。
+録音を持ち出すのと同じ経路で運べる。
+
+> 環境変数は WSL から `cargo.exe` へ渡らない（WSLENV 未経由）ので、
+> `RUSTFLAGS=` ではなく `--config` で渡すこと。
+
 ## 出力
 
 カレントディレクトリに、実行ごとに次の4ファイル。**会議の中身に当たるので `.gitignore` 済み。**
