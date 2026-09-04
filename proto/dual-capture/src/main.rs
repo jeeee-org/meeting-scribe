@@ -138,9 +138,16 @@ fn spawn_writer(
             let samples = match received {
                 Some(c) if c.samples.is_empty() => continue,
                 Some(c) => {
-                    let lag = c.at - frames_written as f64 / rate as f64;
-                    if last_lag.is_finite() && lag - last_lag > 0.2 {
-                        drops.push((c.at, lag - last_lag));
+                            let lag = c.at - frames_written as f64 / rate as f64;
+                    if last_lag.is_finite() {
+                        if lag - last_lag > 0.2 {
+                            drops.push((c.at, lag - last_lag));
+                        }
+                    } else if lag > 0.0 {
+                        // 先頭の空白。録音開始から最初のデータまでも統合器には穴に見える。
+                        // ここを入れないと「サンプル0 = first_data_sec」という第2の原点が要る。
+                        // drops だけで復元できる形にしておく（誤差は約1バッファ）。
+                        drops.push((c.at, lag));
                     }
                     last_lag = lag;
                     Some(c.samples)
@@ -247,6 +254,10 @@ struct Track {
     path: String,
     rate: u32,
     channels_in: u16,
+    /// ループバック側か。ズレの意味が系統で違うので、警告文言の出し分けに使う。
+    loopback: bool,
+    /// 要求したバッファ長（フレーム）。0 は既定（WASAPI の最小リング）。
+    buffer_frames: u32,
     /// コールバックが受け取った累積フレーム数。1秒ごとに主スレッドが読む。
     frames_seen: Arc<AtomicU64>,
     /// underrun / overrun の発生時刻（開始からの秒）。回数だけでは原因が追えない。
@@ -288,6 +299,7 @@ impl Track {
             config.sample_format()
         );
 
+        let sample_format = config.sample_format();
         let (tx, rx) = mpsc::channel::<Chunk>();
         // 相手（ループバック）は常にステレオ前提で残す。システム全体の再生音なので、
         // 通知音・動画・会議アプリが混ざり、モノラルである根拠が無い。
@@ -297,51 +309,70 @@ impl Track {
         let underruns = Arc::new(Mutex::new(Vec::new()));
         let first_data = Arc::new(Mutex::new(None));
 
-        let err_times = Arc::clone(&underruns);
-        let err_fn = move |e| {
-            let at = t0.elapsed().as_secs_f64();
-            let mut times = err_times.lock().unwrap();
-            if times.is_empty() {
-                eprintln!("  !! [{label}] 録音エラー ({at:.2}秒): {e}");
+        // ストリームは2回建てうる（大きいバッファが通らなければ既定へ落とす）ので、
+        // 状態のクローンは毎回この中で取る。
+        let make = |cfg: cpal::StreamConfig| -> Result<cpal::Stream> {
+            let err_times = Arc::clone(&underruns);
+            let err_fn = move |e| {
+                let at = t0.elapsed().as_secs_f64();
+                let mut times = err_times.lock().unwrap();
+                if times.is_empty() {
+                    eprintln!("  !! [{label}] 録音エラー ({at:.2}秒): {e}");
+                }
+                times.push(at);
+            };
+            let sender = tx.clone();
+            let seen = Arc::clone(&frames_seen);
+            let first = Arc::clone(&first_data);
+            let ch = channels_in.max(1) as u64;
+
+            macro_rules! build {
+                ($t:ty, $conv:expr) => {
+                    device.build_input_stream(
+                        cfg,
+                        move |data: &[$t], _: &_| {
+                            if data.is_empty() {
+                                return;
+                            }
+                            let at = t0.elapsed().as_secs_f64();
+                            let mut f = first.lock().unwrap();
+                            if f.is_none() {
+                                *f = Some(at);
+                            }
+                            drop(f);
+                            seen.fetch_add(data.len() as u64 / ch, Ordering::Relaxed);
+                            // コールバックごとに Vec を確保する。10ms 程度の粒度なので実用上
+                            // 問題ないが、本実装ではリングバッファに置き換える余地がある。
+                            let samples: Vec<f32> = data.iter().map($conv).collect();
+                            let _ = sender.send(Chunk { samples, at });
+                        },
+                        err_fn,
+                        None,
+                    )?
+                };
             }
-            times.push(at);
+
+            Ok(match sample_format {
+                cpal::SampleFormat::F32 => build!(f32, |&s| s),
+                cpal::SampleFormat::I16 => build!(i16, |&s| s as f32 / i16::MAX as f32),
+                other => return Err(anyhow!("{label}: 未対応のサンプル形式 {other:?}")),
+            })
         };
 
-        let sender = tx.clone();
-        let seen = Arc::clone(&frames_seen);
-        let first = Arc::clone(&first_data);
-        let ch = channels_in.max(1) as u64;
-
-        macro_rules! build {
-            ($t:ty, $conv:expr) => {
-                device.build_input_stream(
-                    config.clone().into(),
-                    move |data: &[$t], _: &_| {
-                        if data.is_empty() {
-                            return;
-                        }
-                        let at = t0.elapsed().as_secs_f64();
-                        let mut f = first.lock().unwrap();
-                        if f.is_none() {
-                            *f = Some(at);
-                        }
-                        drop(f);
-                        seen.fetch_add(data.len() as u64 / ch, Ordering::Relaxed);
-                        // コールバックごとに Vec を確保する。10ms 程度の粒度なので実用上問題ないが、
-                        // 本実装ではリングバッファに置き換える余地がある。
-                        let samples: Vec<f32> = data.iter().map($conv).collect();
-                        let _ = sender.send(Chunk { samples, at });
-                    },
-                    err_fn,
-                    None,
-                )?
-            };
-        }
-
-        let stream = match config.sample_format() {
-            cpal::SampleFormat::F32 => build!(f32, |&s| s),
-            cpal::SampleFormat::I16 => build!(i16, |&s| s as f32 / i16::MAX as f32),
-            other => return Err(anyhow!("{label}: 未対応のサンプル形式 {other:?}")),
+        // 既定のバッファは WASAPI の最小リングで、こちらが少しでも遅れると取りこぼす。
+        // 70分で underrun 1045回・欠損7.25秒という実測が出た。コールバック周期は
+        // GetDevicePeriod() 固定でバッファ長では変わらないので、**大きくしても遅延は増えず、
+        // 取りこぼしまでの余裕だけが増える**。このPJは停止後に処理するので遅延は問題にならない。
+        let mut cfg: cpal::StreamConfig = config.clone().into();
+        cfg.buffer_size = cpal::BufferSize::Fixed(rate); // 1秒ぶん
+        let (stream, buffer_frames) = match make(cfg) {
+            Ok(s) => (s, rate),
+            Err(e) => {
+                eprintln!("  !! [{label}] 1秒バッファで開けない({e})。既定のバッファへ落とす。");
+                let mut fallback: cpal::StreamConfig = config.clone().into();
+                fallback.buffer_size = cpal::BufferSize::Default;
+                (make(fallback)?, 0)
+            }
         };
         stream.play()?;
 
@@ -351,6 +382,8 @@ impl Track {
             path,
             rate,
             channels_in,
+            loopback,
+            buffer_frames,
             frames_seen,
             underruns,
             first_data,
@@ -385,14 +418,25 @@ impl Track {
             "    録れた長さ  : {captured:.2} 秒 ({} フレーム)",
             stats.frames_written
         );
-        println!(
-            "    ズレ        : {gap:+.2} 秒{}",
-            if gap.abs() > 0.5 {
-                "   ← 再生されていた時間ぶんしか来ていない可能性。統合は時刻ベースで（ADR-004）"
-            } else {
-                ""
-            }
-        );
+        // ズレの意味は系統で違う。相手は「鳴っていた時間しか来ない」ことの現れで、
+        // 自分は「起動遅延 + underrun による欠損」。同じ文言を出すと読み違える。
+        let note = if gap.abs() <= 0.5 {
+            String::new()
+        } else if self.loopback {
+            "   ← 再生されていた時間ぶんしか来ていない。統合は時刻ベースで（ADR-004）".into()
+        } else {
+            format!(
+                "   ← 起動遅延 {:.2}秒 + underrun {} 回ぶんの欠損か（1回あたり {:.1} ms）",
+                first.unwrap_or(0.0),
+                underruns.len(),
+                if underruns.is_empty() {
+                    0.0
+                } else {
+                    (gap - first.unwrap_or(0.0)) * 1000.0 / underruns.len() as f64
+                }
+            )
+        };
+        println!("    ズレ        : {gap:+.2} 秒{note}");
         match first {
             Some(at) => println!("    最初のデータ: 開始から {at:.2} 秒後"),
             None => println!("    最初のデータ: 一度も来なかった   ← このデバイスでは録れていない"),
@@ -449,6 +493,7 @@ impl Track {
         let meta = format!(
             "{{\n  \"label\": \"{}\",\n  \"device\": \"{}\",\n  \"wav\": \"{}\",\n  \
              \"sample_rate\": {},\n  \"channels_device\": {},\n  \"channels_written\": {},\n  \
+             \"buffer_frames_requested\": {},\n  \
              \"downmixed\": {},\n  \"downmix_violations\": {},\n  \"frames_written\": {},\n  \
              \"captured_sec\": {:.3},\n  \"wall_elapsed_sec\": {:.3},\n  \"gap_sec\": {:.3},\n  \
              \"first_data_sec\": {},\n  \"peak_dbfs\": {:.1},\n  \"rms_dbfs\": {:.1},\n  \
@@ -460,6 +505,7 @@ impl Track {
             self.rate,
             self.channels_in,
             stats.channels_out,
+            self.buffer_frames,
             stats.downmixed,
             stats.downmix_violations,
             stats.frames_written,
@@ -620,8 +666,8 @@ fn main() -> Result<()> {
     loop_track.finish(wall)?;
 
     println!("\n見るべき点:");
-    println!("  1. 相手トラックのズレ — 再生していた時間と録れた長さが一致するか（ADR-004 の根拠）");
-    println!("  2. 自分トラックのズレの伸び方 — 一定なら固定オフセット、増え続けるならドリフト");
-    println!("  3. underrun の時刻 — ズレが飛んだ時刻と一致するか");
+    println!("  1. 相手のズレ — 再生していた時間と録れた長さが一致するか（ADR-004 の根拠）");
+    println!("  2. 自分のズレ − 起動遅延 が underrun 件数 × 数ms に収まるか（ADR-006）");
+    println!("  3. underrun の回数 — バッファを1秒にした効果が出ているか");
     Ok(())
 }
