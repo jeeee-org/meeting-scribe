@@ -10,8 +10,8 @@
 //!
 //! 使い方（Windows 側で。WSL では動かない）:
 //!   run.cmd --list                        デバイス一覧を見る
-//!   run.cmd 30                            30 秒録る
-//!   run.cmd 3600 --loopback=Realtek       1時間、エンドポイントを名前で固定して録る
+//!   run.cmd --loopback=Realtek            **Ctrl+C まで録り続ける**（会議はこれ）
+//!   run.cmd 30                            30 秒だけ録る（計測用）
 //!
 //! 出力は WAV 2本と、それぞれに対応する `*-meta.json`（採用したエンドポイント名・
 //! 1秒ごとの累積フレーム・underrun 時刻）。後から「無音だったのはなぜか」を追うための材料。
@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 /// 音声コールバックから書き出しスレッドへ渡す1回ぶん。
@@ -554,6 +554,46 @@ fn json_escape(s: &str) -> String {
         .collect()
 }
 
+/// 途中終了で書きかけになった WAV のヘッダを直す。
+///
+/// hound は作成時にサイズ欄を 0 で書き、`finalize()` で埋める。強制終了されると
+/// 埋められないまま残り、**データはあるのに「not a WAVE file」で読めない**（実測）。
+/// 形式（チャンネル・レート・ビット数）はヘッダに残っているので、
+/// 実ファイルサイズから2つのサイズ欄を書き直すだけで戻る。
+fn repair_wav(path: &str) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write as _};
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("{path} を開けない"))?;
+    let size = f.metadata()?.len();
+    if size < 44 {
+        bail!("{path} は 44 バイト未満。中身が無い。");
+    }
+    let mut head = [0u8; 44];
+    f.read_exact(&mut head)?;
+    if &head[0..4] != b"RIFF" || &head[8..12] != b"WAVE" {
+        bail!("{path} は WAV ではない");
+    }
+    let data_len = (size - 44) as u32;
+    let riff_len = (size - 8) as u32;
+    let ch = u16::from_le_bytes([head[22], head[23]]);
+    let rate = u32::from_le_bytes([head[24], head[25], head[26], head[27]]);
+    let bits = u16::from_le_bytes([head[34], head[35]]);
+
+    f.seek(SeekFrom::Start(4))?;
+    f.write_all(&riff_len.to_le_bytes())?;
+    f.seek(SeekFrom::Start(40))?;
+    f.write_all(&data_len.to_le_bytes())?;
+
+    let secs = data_len as f64 / (rate as f64 * ch as f64 * (bits as f64 / 8.0));
+    println!("{path} を直した: {rate} Hz / {ch}ch / {bits}bit / {secs:.2} 秒");
+    println!("  !! 途中終了した録音なので `*-meta.json` が無い（または不完全）。");
+    println!("     時刻の補正ができないため、統合すると WAV 内の時刻のまま並ぶ。");
+    Ok(())
+}
+
 fn list_devices() -> Result<()> {
     let host = cpal::default_host();
     println!("host: {:?}\n", host.id());
@@ -589,12 +629,19 @@ fn main() -> Result<()> {
     if args.iter().any(|a| a == "--list") {
         return list_devices();
     }
+    if let Some(i) = args.iter().position(|a| a == "--repair") {
+        let target = args
+            .get(i + 1)
+            .ok_or_else(|| anyhow!("--repair のあとに WAV のパスを渡す"))?;
+        return repair_wav(target);
+    }
 
-    let secs: u64 = args
+    // 会議は長さが読めない。秒数を省いたら Ctrl+C まで録り続ける。
+    // 数字を渡すのは計測のときだけ。
+    let secs: Option<u64> = args
         .iter()
         .find(|a| !a.starts_with("--"))
-        .and_then(|a| a.parse().ok())
-        .unwrap_or(30);
+        .and_then(|a| a.parse().ok());
     let opt = |key: &str| {
         args.iter()
             .find_map(|a| a.strip_prefix(key).map(|v| v.to_string()))
@@ -606,7 +653,30 @@ fn main() -> Result<()> {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
-    println!("2系統同時録音（{secs} 秒）\n");
+    match secs {
+        Some(n) => println!("2系統同時録音（{n} 秒）\n"),
+        None => println!("2系統同時録音（Ctrl+C で停止）\n"),
+    }
+
+    // Ctrl+C を捕まえて、書き出しを正常に閉じてから終わる。捕まえないと
+    // hound がヘッダを書けず、データが残っていても読めない WAV になる。
+    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let stop = Arc::clone(&running);
+    ctrlc::set_handler(move || {
+        stop.store(false, Ordering::SeqCst);
+    })
+    .context("Ctrl+C のハンドラを設定できない")?;
+
+    // Ctrl+C は環境によっては届かない（WSL から起動した exe など）。
+    // 信号に依存しない停止手段として、Enter でも止まるようにしておく。
+    // **止め方が1つしか無いと、それが効かなかった時に録音を丸ごと失う。**
+    let stop_key = Arc::clone(&running);
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_ok() {
+            stop_key.store(false, Ordering::SeqCst);
+        }
+    });
 
     // 2系統の時刻を突き合わせるので、時計は1つにする。
     let t0 = Instant::now();
@@ -639,10 +709,16 @@ fn main() -> Result<()> {
     let mut loop_track = Track::start(spk, "相手", true, format!("dual-{stamp}-other.wav"), t0)?;
 
     println!("\n録音中… 1秒ごとに累積フレーム数を出す（実時刻とサンプル数の乖離を追うため）。");
+    if secs.is_none() {
+        println!("停止するときは Ctrl+C か Enter。**強制終了させると WAV が読めなくなる**");
+        println!("（読めなくなっても `--repair <ファイル>` で戻せる。時刻の補正だけ失う）");
+    }
     // 1秒ごとに両系統の累積を読む。ズレが「じわじわ開いた（ドリフト）」のか
     // 「一度に飛んだ（欠損）」のかは、最終サマリだけでは区別できない。
-    for _ in 0..secs {
+    let mut elapsed_ticks = 0u64;
+    while running.load(Ordering::SeqCst) && secs.map_or(true, |n| elapsed_ticks < n) {
         std::thread::sleep(Duration::from_secs(1));
+        elapsed_ticks += 1;
         let at = t0.elapsed().as_secs_f64();
         let lf = loop_track.frames();
         loop_track.timeline.push((at, lf));
@@ -658,7 +734,11 @@ fn main() -> Result<()> {
         println!("  {at:7.1}秒  自分 {mf}  相手 {lf:>10}");
     }
     let wall = t0.elapsed().as_secs_f64();
-    println!("\n停止。");
+    if !running.load(Ordering::SeqCst) {
+        println!("\n停止の指示を受けた。書き出しを閉じる。");
+    } else {
+        println!("\n停止。");
+    }
 
     if let Some(mic_track) = mic_track {
         mic_track.finish(wall)?;

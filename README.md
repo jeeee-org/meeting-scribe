@@ -5,7 +5,9 @@ Slack / Teams の打ち合わせを録り、**話者ラベル付きのトラン�
 自分の声（マイク）と相手の声（PC の再生音）を**別トラックで**録るのが本体価値。
 混ぜて1本にすると誰の発言か落ちる。
 
-**アプリとして配布しない**（ADR-002）。どちらの機械もこのリポジトリを pull して `cargo run` で動かす。
+開発デスクトップはこのリポジトリを pull して `cargo run`。
+**業務ノートへは、いずれインストール形式で配る**（ADR-011。依存ゼロの単一 exe になることは
+確認済み。着手は実会議を数回通してから）。いまは業務ノートも pull して使っている。
 
 ---
 
@@ -46,8 +48,12 @@ WAV の中の時刻は実時刻ではなく、meta.json の `drops_sec_len` が�
 
 ### 1. 録音（業務ノート・Windows 側）
 ```
-proto\dual-capture\run.cmd 3600 --mic=Logi --loopback=Logi > 60min.log
+proto\dual-capture\run.cmd --mic=Logi --loopback=Logi
 ```
+**秒数は指定しない。**会議は長さが読めないので、Ctrl+C か Enter で止まるまで録り続ける。
+**強制終了させないこと。**サイズ欄が書かれず WAV が読めなくなる（`--repair` で戻せるが
+時刻の補正を失う）。
+
 **録音前に Windows の録音音量を確認する。**デバイスごとに別設定で、余裕は 2.2 dB しかない。
 詳細は [proto/dual-capture/README.md](proto/dual-capture/README.md)。
 

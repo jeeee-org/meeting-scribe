@@ -7,6 +7,9 @@ edition = "2021"
 anyhow = "1"
 cpal = "0.18.2"
 hound = "3.5"
+# Ctrl+C を捕まえて正常終了させる。捕まえないと WAV のヘッダが書かれず、
+# データが残っていても「not a WAVE file」で読めなくなる（実測）。
+ctrlc = "3"
 
 [profile.release]
 opt-level = 2
