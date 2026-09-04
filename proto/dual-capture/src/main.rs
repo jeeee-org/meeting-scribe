@@ -90,11 +90,15 @@ fn frame_is_uniform(frame: &[f32]) -> bool {
 ///
 /// 業務ノートの内蔵マイクは 4ch だが**中身はモノラルの複製**なので、最初のチャンクで
 /// それを確かめて 1ch に落とす。平均を取っても同じ値になるだけで、容量が4倍になる。
+/// ダウンミックス判定で「無音でない」とみなすしきい値（約 -80 dBFS）。
+const SILENCE: f32 = 1e-4;
+
 fn spawn_writer(
     rx: Receiver<Chunk>,
     path: String,
     rate: u32,
     channels_in: u16,
+    downmix_allowed: bool,
 ) -> JoinHandle<Result<Stats>> {
     std::thread::spawn(move || -> Result<Stats> {
         let ch_in = channels_in.max(1) as usize;
@@ -112,19 +116,60 @@ fn spawn_writer(
         let mut drops: Vec<(f64, f64)> = Vec::new();
         let mut last_lag = f64::NAN;
 
-        while let Ok(chunk) = rx.recv() {
-            if chunk.samples.is_empty() {
-                continue;
-            }
-            let lag = chunk.at - frames_written as f64 / rate as f64;
-            if last_lag.is_finite() && lag - last_lag > 0.2 {
-                drops.push((chunk.at, lag - last_lag));
-            }
-            last_lag = lag;
-            // 最初の実データでダウンミックスの可否を決める。決めた後は変えられない
-            // （WAV ヘッダを書いてしまうため）ので、以降は破れを数えて報告する。
-            if writer.is_none() {
-                downmix = ch_in > 1 && chunk.samples.chunks_exact(ch_in).all(frame_is_uniform);
+        // ダウンミックスの判定材料。最初の1チャンクだけで決めると、たまたま先頭に来た
+        // モノラルの合図音や通知音を見て「全chが同一」と誤判定する（実際に起きた）。
+        // 無音でないフレームが十分に集まるまで待ってから決める。
+        //
+        // なお**窓を広げても、ループバックでは足りない**。本編の再生が始まるのが数十秒後の
+        // ことがあり、それまでの材料は合図音や通知音しかない。だから相手側は
+        // `downmix_allowed = false` にして構造的に落とさない。窓の拡張はマイク側の保険。
+        let mut pending: Vec<f32> = Vec::new();
+        let mut pending_frames: u64 = 0;
+        let mut probe_nonsilent: u64 = 0;
+        let mut probe_nonuniform: u64 = 0;
+        let decide_frames = rate as u64 * 2; // 2 秒ぶん見る
+        let cap_frames = rate as u64 * 5; // これ以上は待たない
+        let need_nonsilent = (rate / 5) as u64; // 0.2 秒ぶんの有音が判定の最低条件
+
+        loop {
+            let received = rx.recv().ok();
+            let closed = received.is_none();
+
+            let samples = match received {
+                Some(c) if c.samples.is_empty() => continue,
+                Some(c) => {
+                    let lag = c.at - frames_written as f64 / rate as f64;
+                    if last_lag.is_finite() && lag - last_lag > 0.2 {
+                        drops.push((c.at, lag - last_lag));
+                    }
+                    last_lag = lag;
+                    Some(c.samples)
+                }
+                None => None,
+            };
+
+            let to_write: Vec<f32> = if writer.is_none() {
+                if let Some(s) = samples {
+                    for frame in s.chunks_exact(ch_in) {
+                        if frame.iter().any(|v| v.abs() > SILENCE) {
+                            probe_nonsilent += 1;
+                            if !frame_is_uniform(frame) {
+                                probe_nonuniform += 1;
+                            }
+                        }
+                    }
+                    pending_frames += (s.len() / ch_in) as u64;
+                    pending.extend_from_slice(&s);
+                }
+                let enough = probe_nonsilent >= need_nonsilent && pending_frames >= decide_frames;
+                if !closed && !enough && pending_frames < cap_frames {
+                    continue;
+                }
+                // 材料が足りないまま打ち切った時は落とさない（安全側）。
+                downmix = downmix_allowed
+                    && ch_in > 1
+                    && probe_nonsilent >= need_nonsilent
+                    && probe_nonuniform == 0;
                 channels_out = if downmix { 1 } else { channels_in };
                 let spec = hound::WavSpec {
                     channels: channels_out,
@@ -136,21 +181,29 @@ fn spawn_writer(
                     hound::WavWriter::create(&path, spec)
                         .with_context(|| format!("{path} を作成できない"))?,
                 );
-            }
-            let w = writer.as_mut().unwrap();
+                std::mem::take(&mut pending)
+            } else {
+                samples.unwrap_or_default()
+            };
 
-            for frame in chunk.samples.chunks_exact(ch_in) {
-                if downmix && !frame_is_uniform(frame) {
-                    violations += 1;
+            if let Some(w) = writer.as_mut() {
+                for frame in to_write.chunks_exact(ch_in) {
+                    if downmix && !frame_is_uniform(frame) {
+                        violations += 1;
+                    }
+                    let out: &[f32] = if downmix { &frame[..1] } else { frame };
+                    for &s in out {
+                        peak = peak.max(s.abs());
+                        sumsq += (s as f64) * (s as f64);
+                        written_samples += 1;
+                        w.write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)?;
+                    }
+                    frames_written += 1;
                 }
-                let out: &[f32] = if downmix { &frame[..1] } else { frame };
-                for &s in out {
-                    peak = peak.max(s.abs());
-                    sumsq += (s as f64) * (s as f64);
-                    written_samples += 1;
-                    w.write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)?;
-                }
-                frames_written += 1;
+            }
+
+            if closed {
+                break;
             }
         }
 
@@ -236,7 +289,9 @@ impl Track {
         );
 
         let (tx, rx) = mpsc::channel::<Chunk>();
-        let writer = spawn_writer(rx, path.clone(), rate, channels_in);
+        // 相手（ループバック）は常にステレオ前提で残す。システム全体の再生音なので、
+        // 通知音・動画・会議アプリが混ざり、モノラルである根拠が無い。
+        let writer = spawn_writer(rx, path.clone(), rate, channels_in, !loopback);
 
         let frames_seen = Arc::new(AtomicU64::new(0));
         let underruns = Arc::new(Mutex::new(Vec::new()));
@@ -353,18 +408,18 @@ impl Track {
             }
         );
         if stats.downmixed {
-            println!(
-                "    ダウンミックス: {}ch → 1ch（全chが同一だったため）{}",
-                self.channels_in,
-                if stats.downmix_violations > 0 {
-                    format!(
-                        "   !! 途中 {} フレームで同一でなくなった",
-                        stats.downmix_violations
-                    )
-                } else {
-                    String::new()
-                }
-            );
+            if stats.downmix_violations > 0 {
+                println!(
+                    "    ダウンミックス: {}ch → 1ch   !! {} フレームが同一でなかった（全 {} 中）",
+                    self.channels_in, stats.downmix_violations, stats.frames_written
+                );
+                println!("                    判定した区間だけで決めており、前提が崩れている");
+            } else {
+                println!(
+                    "    ダウンミックス: {}ch → 1ch（判定した区間で全chが同一だったため）",
+                    self.channels_in
+                );
+            }
         }
         if !stats.drops.is_empty() {
             let total: f64 = stats.drops.iter().map(|(_, d)| d).sum();
@@ -427,7 +482,7 @@ impl Track {
                 .join(", "),
             self.timeline
                 .iter()
-                .map(|(t, f)| format!("[{t:.1}, {f}]"))
+                .map(|(t, f)| format!("[{t:.3}, {f}]"))
                 .collect::<Vec<_>>()
                 .join(", "),
         );
