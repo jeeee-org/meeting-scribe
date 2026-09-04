@@ -91,6 +91,6 @@ cargo run --release --manifest-path proto/summarize/Cargo.toml -- dual-<epoch>
 |---|---|
 | [REQUIREMENTS.md](REQUIREMENTS.md) | 仕様・スコープ・実機の構成・未決事項 |
 | [PROGRESS.md](PROGRESS.md) | 現在地と次にやること |
-| [docs/adr.md](docs/adr.md) | 意思決定の記録（10件） |
+| [docs/adr.md](docs/adr.md) | 意思決定の記録（11件） |
 | [NOTES.md](NOTES.md) | 学び・罠・実測値 |
 | [docs/checkpoints/](docs/checkpoints/) | 日ごとの詳細ログ |
