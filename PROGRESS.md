@@ -17,11 +17,14 @@
 3. **一連を1コマンドで回せるようにする** — いまは録音・文字起こし・統合・要約が別々。
    実会議で1回通してから、詰まる場所を見て決める
 
-> 手順・見る数字・結果の渡し方は **`proto/dual-capture/README.md`**。
+> 全体の流れとどの機械に何を置くかは **[README.md](README.md)**。
+> 録音の手順・見る数字は **`proto/dual-capture/README.md`**。
 > 実機の構成は REQUIREMENTS.md「実機の構成」。意思決定は **[docs/adr.md](docs/adr.md)**。
 
 ## 未検証で残っているもの
 - **Teams の「通信デバイス」問題**（NOTES.md リスク1）。実際の会議でしか出ない。次の会議で回す。
+- **非常口に `claude` CLI が要る。** `summarize` は `claude -p` を呼ぶ。業務ノートに
+  Claude Code が入っているか未確認。無ければ、非常口は文字起こしと統合までになる。
 
 ## 完了
 - [x] 2026-09-03 初期構成 → [checkpoint](docs/checkpoints/2026-09-03.md)
