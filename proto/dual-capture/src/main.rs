@@ -1,41 +1,56 @@
-//! 2系統同時録音の最小プロトタイプ（Windows 専用）。
+//! 2系統同時録音の計測プロトタイプ（Windows 専用）。
 //!
 //! マイク（自分）と WASAPI ループバック（相手＝PC の再生音）を**別 WAV** に落とす。
 //! cpal は出力デバイスを入力として開くと透過的にループバックになる（NOTES.md 参照）。
 //!
-//! ただしこのプログラムの本命は「録れるか」ではない。録れることはほぼ判っている。
-//! 確かめたいのは **タイムラインが保たれるか**（NOTES.md のリスク2）:
-//! ループバックは再生中のアプリが無いとパケットを返さない可能性があり、
-//! そうなるとサンプル数が経過時間より短くなり、統合時に自分トラックとずれる。
-//! そこで経過時間と実サンプル数を突き合わせ、その差を数字で出す。
+//! このプログラムの目的は「録れるか」ではなく **タイムラインが保たれるか**の計測。
+//! 業務ノート（Realtek）ではループバックが**再生中しかパケットを返さない**ことが判っており、
+//! サンプル数を時刻に換算する実装は壊れる（ADR-004）。ズレがどこで開いたかを追えるよう、
+//! 1秒ごとの累積フレーム数と underrun の発生時刻を記録する。
 //!
 //! 使い方（Windows 側で。WSL では動かない）:
-//!   cargo run --release -- --list        デバイス一覧を見る
-//!   cargo run --release -- 30            30 秒録って 2 本の WAV を書く
-//!   cargo run --release -- 30 --mic=ThinkPad --loopback=Headset
+//!   run.cmd --list                        デバイス一覧を見る
+//!   run.cmd 30                            30 秒録る
+//!   run.cmd 3600 --loopback=Realtek       1時間、エンドポイントを名前で固定して録る
 //!
-//! 検証手順: 録音を始めたら、最初の 10 秒は**何も再生せず自分だけ喋る**。
-//! 残りで相手側（動画でも可）を鳴らす。無音区間の扱いはこの前半に出る。
+//! 出力は WAV 2本と、それぞれに対応する `*-meta.json`（採用したエンドポイント名・
+//! 1秒ごとの累積フレーム・underrun 時刻）。後から「無音だったのはなぜか」を追うための材料。
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
-/// 録音中の1系統。ストリームは drop すると止まるので手放さずに持つ。
-struct Track {
-    label: &'static str,
-    device_name: String,
-    samples: Arc<Mutex<Vec<f32>>>,
-    rate: u32,
-    channels: u16,
-    callbacks: Arc<AtomicUsize>,
-    errors: Arc<AtomicUsize>,
-    first_data: Arc<Mutex<Option<Instant>>>,
-    started: Instant,
-    stream: cpal::Stream,
+/// 音声コールバックから書き出しスレッドへ渡す1回ぶん。
+struct Chunk {
+    samples: Vec<f32>,
+    /// 録音開始からの経過秒（到着時刻）。ADR-004 のためにサンプル数と別に持つ。
+    at: f64,
+}
+
+/// 書き出しスレッドが返す集計。
+struct Stats {
+    frames_written: u64,
+    channels_out: u16,
+    peak: f32,
+    rms: f64,
+    downmixed: bool,
+    /// ダウンミックス中に「4ch が同一」でなくなったフレーム数。0 でなければ前提が崩れている。
+    downmix_violations: u64,
+    /// パケットが来なかった区間 (検出時刻, 空いた秒数)。ADR-004 の埋めるべき穴そのもの。
+    drops: Vec<(f64, f64)>,
+}
+
+fn dbfs(v: f64) -> f64 {
+    if v <= 0.0 {
+        -120.0
+    } else {
+        20.0 * v.log10()
+    }
 }
 
 fn device_name(device: &cpal::Device) -> String {
@@ -63,13 +78,147 @@ fn pick(
     fallback.ok_or_else(|| anyhow!("{kind}が見つからない"))
 }
 
+/// 1フレームぶんの全チャンネルが同一値か。
+fn frame_is_uniform(frame: &[f32]) -> bool {
+    frame.windows(2).all(|w| w[0] == w[1])
+}
+
+/// 受け取ったサンプルをその場で WAV へ流す。
+///
+/// 溜めてから書くと、実測フォーマット（自分 48kHz×4ch / 相手 96kHz×2ch）では
+/// 60分で約 5.5GB になり業務ノートで走らない。逐次書き出しが 60分テストの前提条件。
+///
+/// 業務ノートの内蔵マイクは 4ch だが**中身はモノラルの複製**なので、最初のチャンクで
+/// それを確かめて 1ch に落とす。平均を取っても同じ値になるだけで、容量が4倍になる。
+fn spawn_writer(
+    rx: Receiver<Chunk>,
+    path: String,
+    rate: u32,
+    channels_in: u16,
+) -> JoinHandle<Result<Stats>> {
+    std::thread::spawn(move || -> Result<Stats> {
+        let ch_in = channels_in.max(1) as usize;
+        let mut writer: Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>> = None;
+        let mut downmix = false;
+        let mut channels_out = channels_in;
+
+        let mut frames_written: u64 = 0;
+        let mut peak = 0.0f32;
+        let mut sumsq = 0.0f64;
+        let mut written_samples: u64 = 0;
+        let mut violations: u64 = 0;
+        // 到着時刻と「それまでに届いた音の長さ」の差。無音でパケットが止まると、
+        // 止まっていた分だけこの差が一段増える。増えた時刻と量が、埋めるべき穴になる。
+        let mut drops: Vec<(f64, f64)> = Vec::new();
+        let mut last_lag = f64::NAN;
+
+        while let Ok(chunk) = rx.recv() {
+            if chunk.samples.is_empty() {
+                continue;
+            }
+            let lag = chunk.at - frames_written as f64 / rate as f64;
+            if last_lag.is_finite() && lag - last_lag > 0.2 {
+                drops.push((chunk.at, lag - last_lag));
+            }
+            last_lag = lag;
+            // 最初の実データでダウンミックスの可否を決める。決めた後は変えられない
+            // （WAV ヘッダを書いてしまうため）ので、以降は破れを数えて報告する。
+            if writer.is_none() {
+                downmix = ch_in > 1 && chunk.samples.chunks_exact(ch_in).all(frame_is_uniform);
+                channels_out = if downmix { 1 } else { channels_in };
+                let spec = hound::WavSpec {
+                    channels: channels_out,
+                    sample_rate: rate,
+                    bits_per_sample: 16,
+                    sample_format: hound::SampleFormat::Int,
+                };
+                writer = Some(
+                    hound::WavWriter::create(&path, spec)
+                        .with_context(|| format!("{path} を作成できない"))?,
+                );
+            }
+            let w = writer.as_mut().unwrap();
+
+            for frame in chunk.samples.chunks_exact(ch_in) {
+                if downmix && !frame_is_uniform(frame) {
+                    violations += 1;
+                }
+                let out: &[f32] = if downmix { &frame[..1] } else { frame };
+                for &s in out {
+                    peak = peak.max(s.abs());
+                    sumsq += (s as f64) * (s as f64);
+                    written_samples += 1;
+                    w.write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)?;
+                }
+                frames_written += 1;
+            }
+        }
+
+        // 一度もデータが来なかった系統でも、空の WAV は残す（「無かった」ことの記録になる）。
+        let w = match writer {
+            Some(w) => w,
+            None => {
+                let spec = hound::WavSpec {
+                    channels: channels_in,
+                    sample_rate: rate,
+                    bits_per_sample: 16,
+                    sample_format: hound::SampleFormat::Int,
+                };
+                hound::WavWriter::create(&path, spec)
+                    .with_context(|| format!("{path} を作成できない"))?
+            }
+        };
+        w.finalize()?;
+
+        let rms = if written_samples == 0 {
+            0.0
+        } else {
+            (sumsq / written_samples as f64).sqrt()
+        };
+        Ok(Stats {
+            frames_written,
+            channels_out,
+            peak,
+            rms,
+            downmixed: downmix,
+            downmix_violations: violations,
+            drops,
+        })
+    })
+}
+
+/// 録音中の1系統。ストリームは drop すると止まる。
+struct Track {
+    label: &'static str,
+    device_name: String,
+    path: String,
+    rate: u32,
+    channels_in: u16,
+    /// コールバックが受け取った累積フレーム数。1秒ごとに主スレッドが読む。
+    frames_seen: Arc<AtomicU64>,
+    /// underrun / overrun の発生時刻（開始からの秒）。回数だけでは原因が追えない。
+    underruns: Arc<Mutex<Vec<f64>>>,
+    first_data: Arc<Mutex<Option<f64>>>,
+    /// (経過秒, 累積フレーム) の 1 秒ごとの記録。
+    timeline: Vec<(f64, u64)>,
+    stream: cpal::Stream,
+    tx: Option<Sender<Chunk>>,
+    writer: JoinHandle<Result<Stats>>,
+}
+
 impl Track {
     /// 録音を開始する。`loopback` が true なら出力デバイスを入力として開く。
     ///
     /// 設定の取り方が系統で違うのが罠。ループバックでは `default_input_config()` は
-    /// 「このデバイスは入力に対応していない」で失敗する（cpal は data_flow で弾く）。
+    /// 「このデバイスは入力に対応していない」で失敗する（cpal はデータフローで弾く）。
     /// 出力デバイスの設定は `default_output_config()` から取り、それで入力ストリームを建てる。
-    fn start(device: cpal::Device, label: &'static str, loopback: bool) -> Result<Self> {
+    fn start(
+        device: cpal::Device,
+        label: &'static str,
+        loopback: bool,
+        path: String,
+        t0: Instant,
+    ) -> Result<Self> {
         let config = if loopback {
             device.default_output_config()
         } else {
@@ -79,48 +228,54 @@ impl Track {
 
         let name = device_name(&device);
         let rate = config.sample_rate();
-        let channels = config.channels();
+        let channels_in = config.channels();
+        // 採用したエンドポイントは必ず残す。「無音だったのはなぜか」を後から追う起点になる。
         println!(
-            "  [{label}] {name}\n          {rate} Hz / {channels} ch / {:?}",
+            "  [{label}] {name}\n          {rate} Hz / {channels_in} ch / {:?} → {path}",
             config.sample_format()
         );
 
-        // コールバック内で再確保が起きないよう 5 分ぶん先に確保する。
-        // realloc は音声スレッドを止めるので、オーバーランの原因になる。
-        let samples = Arc::new(Mutex::new(Vec::<f32>::with_capacity(
-            rate as usize * channels.max(1) as usize * 300,
-        )));
-        let callbacks = Arc::new(AtomicUsize::new(0));
-        let errors = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = mpsc::channel::<Chunk>();
+        let writer = spawn_writer(rx, path.clone(), rate, channels_in);
+
+        let frames_seen = Arc::new(AtomicU64::new(0));
+        let underruns = Arc::new(Mutex::new(Vec::new()));
         let first_data = Arc::new(Mutex::new(None));
 
-        let err_count = Arc::clone(&errors);
+        let err_times = Arc::clone(&underruns);
         let err_fn = move |e| {
-            // エラーは連続して出るので最初の1件だけ表示し、以降は数える。
-            if err_count.fetch_add(1, Ordering::Relaxed) == 0 {
-                eprintln!("  !! [{label}] 録音エラー: {e}");
+            let at = t0.elapsed().as_secs_f64();
+            let mut times = err_times.lock().unwrap();
+            if times.is_empty() {
+                eprintln!("  !! [{label}] 録音エラー ({at:.2}秒): {e}");
             }
+            times.push(at);
         };
 
-        let sink = Arc::clone(&samples);
-        let cb_count = Arc::clone(&callbacks);
+        let sender = tx.clone();
+        let seen = Arc::clone(&frames_seen);
         let first = Arc::clone(&first_data);
-        let started = Instant::now();
+        let ch = channels_in.max(1) as u64;
 
         macro_rules! build {
             ($t:ty, $conv:expr) => {
                 device.build_input_stream(
                     config.clone().into(),
                     move |data: &[$t], _: &_| {
-                        cb_count.fetch_add(1, Ordering::Relaxed);
-                        if !data.is_empty() {
-                            let mut f = first.lock().unwrap();
-                            if f.is_none() {
-                                *f = Some(Instant::now());
-                            }
+                        if data.is_empty() {
+                            return;
                         }
-                        let mut buf = sink.lock().unwrap();
-                        buf.extend(data.iter().map($conv));
+                        let at = t0.elapsed().as_secs_f64();
+                        let mut f = first.lock().unwrap();
+                        if f.is_none() {
+                            *f = Some(at);
+                        }
+                        drop(f);
+                        seen.fetch_add(data.len() as u64 / ch, Ordering::Relaxed);
+                        // コールバックごとに Vec を確保する。10ms 程度の粒度なので実用上問題ないが、
+                        // 本実装ではリングバッファに置き換える余地がある。
+                        let samples: Vec<f32> = data.iter().map($conv).collect();
+                        let _ = sender.send(Chunk { samples, at });
                     },
                     err_fn,
                     None,
@@ -138,84 +293,164 @@ impl Track {
         Ok(Self {
             label,
             device_name: name,
-            samples,
+            path,
             rate,
-            channels,
-            callbacks,
-            errors,
+            channels_in,
+            frames_seen,
+            underruns,
             first_data,
-            started,
+            timeline: Vec::new(),
             stream,
+            tx: Some(tx),
+            writer,
         })
     }
 
-    /// WAV に書き出し、タイムラインのズレを報告する。
-    fn finish(self, path: &str, elapsed: Duration) -> Result<()> {
-        drop(self.stream); // 先に止める。以降バッファは増えない。
-        let buf = self.samples.lock().unwrap();
+    fn frames(&self) -> u64 {
+        self.frames_seen.load(Ordering::Relaxed)
+    }
 
-        let frames = buf.len() / self.channels.max(1) as usize;
-        let captured = frames as f64 / self.rate as f64;
-        let wall = elapsed.as_secs_f64();
+    /// ストリームを止め、書き出しの完了を待って集計を報告する。
+    fn finish(mut self, wall: f64) -> Result<()> {
+        drop(self.stream); // 先に止める。以降コールバックは来ない。
+        self.tx.take(); // 送信側を落とすと書き出しスレッドが抜ける。
+        let stats = self
+            .writer
+            .join()
+            .map_err(|_| anyhow!("{}: 書き出しスレッドが落ちた", self.label))??;
+
+        let captured = stats.frames_written as f64 / self.rate as f64;
         let gap = wall - captured;
-
-        // 「録れているつもりで無音」が最悪の失敗なので、必ず中身の大きさを見る。
-        let peak = buf.iter().fold(0.0f32, |m, s| m.max(s.abs()));
-        let rms = if buf.is_empty() {
-            0.0
-        } else {
-            (buf.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / buf.len() as f64).sqrt()
-        };
-        let dbfs = |v: f64| if v <= 0.0 { -120.0 } else { 20.0 * v.log10() };
+        let underruns = self.underruns.lock().unwrap().clone();
+        let first = *self.first_data.lock().unwrap();
 
         println!("\n  [{}] {}", self.label, self.device_name);
         println!("    実経過      : {wall:.2} 秒");
-        println!("    録れた長さ  : {captured:.2} 秒 ({frames} フレーム)");
+        println!(
+            "    録れた長さ  : {captured:.2} 秒 ({} フレーム)",
+            stats.frames_written
+        );
         println!(
             "    ズレ        : {gap:+.2} 秒{}",
             if gap.abs() > 0.5 {
-                "   ← 要注意。統合時に自分トラックとずれる"
+                "   ← 再生されていた時間ぶんしか来ていない可能性。統合は時刻ベースで（ADR-004）"
             } else {
                 ""
             }
         );
-        if let Some(first) = *self.first_data.lock().unwrap() {
-            println!(
-                "    最初のデータ: 開始から {:.2} 秒後",
-                first.duration_since(self.started).as_secs_f64()
-            );
-        } else {
-            println!("    最初のデータ: 一度も来なかった   ← このデバイスでは録れていない");
+        match first {
+            Some(at) => println!("    最初のデータ: 開始から {at:.2} 秒後"),
+            None => println!("    最初のデータ: 一度も来なかった   ← このデバイスでは録れていない"),
         }
         println!(
             "    音量        : ピーク {:.1} dBFS / RMS {:.1} dBFS{}",
-            dbfs(peak as f64),
-            dbfs(rms),
-            if peak < 0.001 { "   ← ほぼ無音。デバイス選択を疑う" } else { "" }
+            dbfs(stats.peak as f64),
+            dbfs(stats.rms),
+            if stats.peak < 0.001 {
+                "   ← ほぼ無音。デバイス選択と Windows の録音音量を疑う"
+            } else {
+                ""
+            }
         );
-        println!(
-            "    コールバック: {} 回 / エラー {} 回",
-            self.callbacks.load(Ordering::Relaxed),
-            self.errors.load(Ordering::Relaxed)
-        );
-
-        // 素の 16bit PCM で、レート・チャンネル数はデバイスのまま書く。
-        // ここで変換すると、後で疑う対象が増える。
-        let spec = hound::WavSpec {
-            channels: self.channels,
-            sample_rate: self.rate,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-        let mut writer = hound::WavWriter::create(path, spec)
-            .with_context(|| format!("{path} を作成できない"))?;
-        for &s in buf.iter() {
-            writer.write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)?;
+        if stats.downmixed {
+            println!(
+                "    ダウンミックス: {}ch → 1ch（全chが同一だったため）{}",
+                self.channels_in,
+                if stats.downmix_violations > 0 {
+                    format!(
+                        "   !! 途中 {} フレームで同一でなくなった",
+                        stats.downmix_violations
+                    )
+                } else {
+                    String::new()
+                }
+            );
         }
-        writer.finalize()?;
-        println!("    出力        : {path}");
+        if !stats.drops.is_empty() {
+            let total: f64 = stats.drops.iter().map(|(_, d)| d).sum();
+            println!(
+                "    無通信区間  : {} 回 / 合計 {:.2} 秒   ← ここを時刻で埋める（ADR-004）",
+                stats.drops.len(),
+                total
+            );
+            for (at, d) in stats.drops.iter().take(8) {
+                println!("                  {at:7.2}秒 で {d:.2} 秒ぶん");
+            }
+            if stats.drops.len() > 8 {
+                println!("                  …他 {} 件（meta.json に全件）", stats.drops.len() - 8);
+            }
+        }
+        println!(
+            "    underrun    : {} 回{}",
+            underruns.len(),
+            match (underruns.first(), underruns.last()) {
+                (Some(a), Some(b)) if underruns.len() > 1 => format!("（{a:.1}秒〜{b:.1}秒）"),
+                (Some(a), _) => format!("（{a:.1}秒）"),
+                _ => String::new(),
+            }
+        );
+        println!("    出力        : {}", self.path);
+
+        let meta = format!(
+            "{{\n  \"label\": \"{}\",\n  \"device\": \"{}\",\n  \"wav\": \"{}\",\n  \
+             \"sample_rate\": {},\n  \"channels_device\": {},\n  \"channels_written\": {},\n  \
+             \"downmixed\": {},\n  \"downmix_violations\": {},\n  \"frames_written\": {},\n  \
+             \"captured_sec\": {:.3},\n  \"wall_elapsed_sec\": {:.3},\n  \"gap_sec\": {:.3},\n  \
+             \"first_data_sec\": {},\n  \"peak_dbfs\": {:.1},\n  \"rms_dbfs\": {:.1},\n  \
+             \"underrun_sec\": [{}],\n  \"drops_sec_len\": [{}],\n  \
+             \"timeline_sec_frames\": [{}]\n}}\n",
+            json_escape(self.label),
+            json_escape(&self.device_name),
+            json_escape(&self.path),
+            self.rate,
+            self.channels_in,
+            stats.channels_out,
+            stats.downmixed,
+            stats.downmix_violations,
+            stats.frames_written,
+            captured,
+            wall,
+            gap,
+            first.map(|v| format!("{v:.3}")).unwrap_or("null".into()),
+            dbfs(stats.peak as f64),
+            dbfs(stats.rms),
+            underruns
+                .iter()
+                .map(|v| format!("{v:.3}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            stats
+                .drops
+                .iter()
+                .map(|(at, d)| format!("[{at:.3}, {d:.3}]"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            self.timeline
+                .iter()
+                .map(|(t, f)| format!("[{t:.1}, {f}]"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        let meta_path = self
+            .path
+            .strip_suffix(".wav")
+            .map(|s| format!("{s}-meta.json"))
+            .unwrap_or_else(|| format!("{}-meta.json", self.path));
+        std::fs::write(&meta_path, meta).with_context(|| format!("{meta_path} を書けない"))?;
+        println!("    メタ        : {meta_path}");
         Ok(())
     }
+}
+
+fn json_escape(s: &str) -> String {
+    s.chars()
+        .flat_map(|c| match c {
+            '"' => vec!['\\', '"'],
+            '\\' => vec!['\\', '\\'],
+            '\n' => vec!['\\', 'n'],
+            c => vec![c],
+        })
+        .collect()
 }
 
 fn list_devices() -> Result<()> {
@@ -243,8 +478,8 @@ fn list_devices() -> Result<()> {
             Err(e) => println!("  {name}{mark}\n      設定を取得できない: {e}"),
         }
     }
-    println!("\n※ Teams は通常の再生デバイスとは別に「通信デバイス」を持てる。");
-    println!("   既定を機械的に選ぶと無音の WAV ができるので、会議中に実際に音が出ている先を確かめる。");
+    println!("\n※ ヘッドホンジャックのエンドポイントは抜き差しで一覧から出入りし、既定が");
+    println!("   耳に届かないデバイスへ移る。`--loopback=<名前の一部>` で固定すること（ADR-005）。");
     Ok(())
 }
 
@@ -267,17 +502,28 @@ fn main() -> Result<()> {
     let loop_needle = opt("--loopback=");
 
     let host = cpal::default_host();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
     println!("2系統同時録音（{secs} 秒）\n");
 
+    // 2系統の時刻を突き合わせるので、時計は1つにする。
+    let t0 = Instant::now();
+
     // マイクが無い機械（開発デスクトップ等）でもループバック側だけは測れるようにする。
-    // 無音時にパケットが来るかの確認はマイクと無関係なので、ここで落とすと検証ができない。
-    let mic_track = match pick(
+    let mut mic_track = match pick(
         host.input_devices()?,
         mic_needle.as_deref(),
         host.default_input_device(),
         "入力デバイス",
     ) {
-        Ok(mic) => Some(Track::start(mic, "自分", false)?),
+        Ok(mic) => Some(Track::start(
+            mic,
+            "自分",
+            false,
+            format!("dual-{stamp}-self.wav"),
+            t0,
+        )?),
         Err(e) => {
             eprintln!("  !! マイクを開けない({e})。ループバックだけで続ける。");
             None
@@ -289,28 +535,38 @@ fn main() -> Result<()> {
         host.default_output_device(),
         "出力デバイス",
     )?;
-    let loop_track = Track::start(spk, "相手", true)?;
+    let mut loop_track = Track::start(spk, "相手", true, format!("dual-{stamp}-other.wav"), t0)?;
 
-    // 2本のストリームは別々のクロックで動く。開始時刻の差はここでは詰められないので、
-    // まとめて計時し、後段の統合はサンプル数ではなく時刻で行う前提にする。
-    let t0 = Instant::now();
-    println!("\n録音中… 前半は何も再生せず自分だけ喋り、後半で相手側の音を鳴らす。");
-    std::thread::sleep(Duration::from_secs(secs));
-    let elapsed = t0.elapsed();
+    println!("\n録音中… 1秒ごとに累積フレーム数を出す（実時刻とサンプル数の乖離を追うため）。");
+    // 1秒ごとに両系統の累積を読む。ズレが「じわじわ開いた（ドリフト）」のか
+    // 「一度に飛んだ（欠損）」のかは、最終サマリだけでは区別できない。
+    for _ in 0..secs {
+        std::thread::sleep(Duration::from_secs(1));
+        let at = t0.elapsed().as_secs_f64();
+        let lf = loop_track.frames();
+        loop_track.timeline.push((at, lf));
+        let mf = match mic_track.as_mut() {
+            Some(t) => {
+                let f = t.frames();
+                t.timeline.push((at, f));
+                format!("{:>10}", f)
+            }
+            None => "         -".into(),
+        };
+        // 秒数 / 自分の累積フレーム / 相手の累積フレーム
+        println!("  {at:7.1}秒  自分 {mf}  相手 {lf:>10}");
+    }
+    let wall = t0.elapsed().as_secs_f64();
     println!("\n停止。");
 
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs();
     if let Some(mic_track) = mic_track {
-        mic_track.finish(&format!("dual-{stamp}-self.wav"), elapsed)?;
+        mic_track.finish(wall)?;
     }
-    loop_track.finish(&format!("dual-{stamp}-other.wav"), elapsed)?;
+    loop_track.finish(wall)?;
 
     println!("\n見るべき点:");
-    println!("  1. 相手トラックの「ズレ」が 0 に近いか。大きければ無音時にパケットが来ていない");
-    println!("     → 統合は時刻ベースで無音を埋める設計が必須になる");
-    println!("  2. 自分トラックに相手の声が入っていないか（ヘッドセットなら入らないはず）");
-    println!("  3. 2本のレート・チャンネル数の違い（統合時に揃える対象）");
+    println!("  1. 相手トラックのズレ — 再生していた時間と録れた長さが一致するか（ADR-004 の根拠）");
+    println!("  2. 自分トラックのズレの伸び方 — 一定なら固定オフセット、増え続けるならドリフト");
+    println!("  3. underrun の時刻 — ズレが飛んだ時刻と一致するか");
     Ok(())
 }
