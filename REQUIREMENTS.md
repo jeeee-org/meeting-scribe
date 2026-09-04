@@ -58,6 +58,16 @@ Slack / Teams などで行う打ち合わせを、**開始と停止のホット�
 レートはエンドポイントで決まる（同じ機械でヘッドホンジャックは 96000 Hz、内蔵は 48000 Hz）。
 **統合前のリサンプルは実行時に読んだ値で組み、定数で書かない。**
 
+### 文字起こし機（開発デスクトップ / RTX 5080）
+| | 場所 |
+|---|---|
+| whisper 本体 | `C:\ms-build\whisper\cublas\Release\whisper-cli.exe`（公式ビルド済み cuBLAS 12.4） |
+| モデル | `C:\ms-build\whisper\models\ggml-large-v3-turbo-q5_0.bin` |
+
+実測 実時間比 **0.0459**（業務ノート CPU の 73倍）。69分の音声で3.2分、2トラックで6.3分。
+sm_120 のネイティブ cubin は入っていないが PTX の JIT で動く。**初回だけ約10秒遅い**（JIT）。
+統合は `proto/merge-transcript`（WSL 側で動く）。
+
 ## 非機能要件
 
 | 項目 | 目標 |
