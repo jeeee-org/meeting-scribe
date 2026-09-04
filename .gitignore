@@ -16,7 +16,10 @@ summaries/
 models/
 
 # --- Rust ---
+# target/ だけだと target-static/ のような別名のビルド先が漏れる（実際に 183MB 混入させた）。
+# ビルド先を別名にすることがあるので、接頭辞でまとめて弾く。
 target/
+target-*/
 
 # --- Python ---
 __pycache__/
